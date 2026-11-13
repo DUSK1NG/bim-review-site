@@ -28,7 +28,7 @@ button:disabled{opacity:.65;cursor:default}
 <body>
 <main>
   <h1>A–D 晋级赛复习台</h1>
-  <p>请输入访问密码。</p>
+  <p>首次进入需要输入密码，此浏览器会保留解锁状态。</p>
   <form id="unlock" method="post">
     <label for="password">访问密码</label>
     <input id="password" type="password" autocomplete="current-password" autocapitalize="none" spellcheck="false" required>
@@ -105,7 +105,7 @@ async function readBank() {
     }
     downloadState.textContent = "题库已载入 · 100%";
     downloadSpeed.textContent = speedLabel(received, performance.now() - started);
-    return bytes;
+    return {bytes, etag: response.headers.get("ETag")};
   } finally {
     clearInterval(timer);
   }
@@ -133,6 +133,118 @@ function unlockFailed(message) {
   input.focus();
 }
 
+async function accessSavedKey(entry) {
+  const database = await new Promise((resolve, reject) => {
+    const request = indexedDB.open("bim-review-access", 1);
+    request.onupgradeneeded = () => request.result.createObjectStore("access");
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = database.transaction("access", entry ? "readwrite" : "readonly");
+      const store = transaction.objectStore("access");
+      const request = entry ? store.put(entry, "bank") : store.get("bank");
+      transaction.oncomplete = () => resolve(request.result);
+      transaction.onabort = () => reject(transaction.error);
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function decryptBank(bank, material) {
+  const salt = bank.bytes.subarray(lengthSize, lengthSize + saltSize);
+  const key = await crypto.subtle.deriveKey({name:"PBKDF2",salt,iterations:600000,hash:"SHA-256"},
+    material, {name:"AES-GCM",length:256}, false, ["decrypt"]);
+  const iv = bank.bytes.subarray(lengthSize + saltSize, headerSize);
+  const plaintext = await crypto.subtle.decrypt({name:"AES-GCM",iv}, key, bank.bytes.subarray(headerSize));
+  return new TextDecoder().decode(plaintext);
+}
+
+function enterReview(html, etag, sessionNote = "") {
+  bankDownload = undefined;
+  document.open();
+  document.write(html);
+  document.close();
+
+  const notice = document.getElementById("site-update");
+  if (!notice) return;
+  const status = document.getElementById("site-update-status");
+  const reload = document.getElementById("site-update-reload");
+  const showStatus = message => {
+    status.textContent = message;
+    notice.hidden = !message;
+  };
+  showStatus(sessionNote);
+  if (!etag) {
+    showStatus("此题库缺少版本标识。刷新页面可重新载入。");
+    return;
+  }
+
+  let checking = false;
+  let lastCheck = Date.now();
+  let updateAvailable = false;
+  const checkEvery = 5 * 60 * 1000;
+  async function checkUpdate() {
+    if (document.hidden || checking || updateAvailable || Date.now() - lastCheck < checkEvery) return;
+    checking = true;
+    lastCheck = Date.now();
+    try {
+      const response = await fetch("./bank.bin", {method:"HEAD",cache:"no-cache"});
+      const latest = response.headers.get("ETag");
+      if (!response.ok || !latest) throw new Error("题库版本响应不可用");
+      if (latest !== etag) {
+        updateAvailable = true;
+        showStatus("已发现新版。请提交当前答案后载入，或下次打开时自动更新。");
+        reload.hidden = false;
+      } else {
+        showStatus(sessionNote);
+      }
+    } catch {
+      showStatus("暂时无法检查更新，可继续使用当前版本。");
+    } finally {
+      checking = false;
+    }
+  }
+  reload.addEventListener("click", () => location.reload());
+  document.addEventListener("visibilitychange", checkUpdate);
+  window.addEventListener("pageshow", checkUpdate);
+  setInterval(checkUpdate, checkEvery);
+}
+
+async function restoreAccess() {
+  let saved;
+  try {
+    saved = await accessSavedKey();
+  } catch {
+    feedback.textContent = "浏览器无法读取已保存的解锁状态，请输入访问密码。";
+  }
+  if (!saved) {
+    button.disabled = false;
+    startBankDownload();
+    return;
+  }
+
+  button.textContent = "正在载入题库…";
+  let bank;
+  try {
+    bank = await startBankDownload();
+  } catch {
+    unlockFailed("题库下载失败，请检查网络后刷新。");
+    return;
+  }
+  let html;
+  try {
+    html = await decryptBank(bank, saved);
+  } catch (error) {
+    unlockFailed(error.name === "OperationError" ? "已保存的解锁状态无法打开当前题库，请重新输入访问密码。" :
+      "浏览器无法恢复已保存的解锁状态，请重新输入访问密码。");
+    return;
+  }
+  enterReview(html, bank.etag);
+}
+
 if (window.crypto.subtle) {
   form.onsubmit = async event => {
     event.preventDefault();
@@ -150,25 +262,23 @@ if (window.crypto.subtle) {
       return;
     }
     button.textContent = "正在解锁…";
-    const salt = bank.subarray(lengthSize, lengthSize + saltSize);
-    const iv = bank.subarray(lengthSize + saltSize, headerSize);
-    let html;
+    let material, html;
     try {
-      const material = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
-      const key = await crypto.subtle.deriveKey({name:"PBKDF2",salt,iterations:600000,hash:"SHA-256"},
-        material, {name:"AES-GCM",length:256}, false, ["decrypt"]);
-      const plaintext = await crypto.subtle.decrypt({name:"AES-GCM",iv}, key, bank.subarray(headerSize));
-      html = new TextDecoder().decode(plaintext);
+      material = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+      html = await decryptBank(bank, material);
     } catch (error) {
       unlockFailed(error.name === "OperationError" ? "密码不正确，请再试一次。" : "浏览器无法解锁页面，请重试。");
       return;
     }
-    document.open();
-    document.write(html);
-    document.close();
+    let sessionNote = "";
+    try {
+      await accessSavedKey(material);
+    } catch {
+      sessionNote = "浏览器无法保留解锁状态，下次进入需重新输入密码。";
+    }
+    enterReview(html, bank.etag, sessionNote);
   };
-  button.disabled = false;
-  startBankDownload();
+  restoreAccess();
 } else {
   feedback.textContent = "此浏览器环境无法解锁，请通过 HTTPS 在新版浏览器中打开。";
 }
